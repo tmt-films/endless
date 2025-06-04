@@ -4,7 +4,7 @@
 # Dependencies: telethon, schedule, pymongo, python-dotenv
 # Setup Instructions:
 # 1. Install dependencies: `pip install telethon==1.36.0 schedule==1.2.2 pymongo==4.10.1 python-dotenv==1.0.1`
-# 2. Create a .env file in /home/ubuntu/Asch/ with:
+# 2. Create a .env file in the same directory as bot.py with:
 #    API_ID=your_api_id
 #    API_HASH=your_api_hash
 #    BOT_TOKEN=your_bot_token
@@ -13,9 +13,9 @@
 # 4. Obtain BOT_TOKEN from BotFather.
 # 5. Ensure MongoDB is running: `sudo systemctl start mongod`
 # 6. Add the bot to your Telegram group with permissions to send messages, photos, and videos.
-# 7. Run: `python /home/ubuntu/Asch/bot.py`
+# 7. Run: `python bot.py`
 # Notes:
-# - Check /home/ubuntu/Asch/bot.log for debugging.
+# - Check bot.log for debugging (located in the same directory as bot.py).
 # - Test with regular and anonymous admins.
 # - First run may prompt for authentication.
 # - New messages with the same schedule_name in a group automatically delete existing ones (sent or unsent).
@@ -36,9 +36,12 @@ from bson import ObjectId
 import os
 from dotenv import load_dotenv
 from pymongo.errors import ConnectionFailure, OperationFailure
+from telethon.errors.rpcerrorlist import MessageDeleteForbiddenError, MessageIdInvalidError
 
 # Load environment variables
-load_dotenv()
+# Look for .env in the same directory as the script
+dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+load_dotenv(dotenv_path=dotenv_path)
 
 # Configuration Section
 CONFIG = {
@@ -49,7 +52,7 @@ CONFIG = {
     'MONGODB_DATABASE': 'telegram_scheduler',
     'MONGODB_COLLECTION': 'messages',
     'MONGODB_TIMEOUT_MS': 5000,
-    'LOG_FILE': 'bot.log',
+    'LOG_FILE': os.path.join(os.path.dirname(__file__), 'bot.log'),
     'SCHEDULE_CHECK_INTERVAL_SECONDS': 1,
     'SESSION_NAME': 'bot_session',
     'MONGODB_RETRIES': 3,
@@ -320,12 +323,27 @@ class MessageSchedulerBot:
                     "chat_id": chat_id
                 })
                 if existing_message:
-                    old_msg_id = str(existing_message['_id'])
-                    sent_status = existing_message.get('sent', False)
-                    self.collection.delete_one({"_id": ObjectId(old_msg_id)})
-                    if not sent_status:
-                        schedule.clear(f"message_{old_msg_id}")
-                    logger.info(f"Auto-deleted existing message {old_msg_id} (sent: {sent_status}) with schedule_name '{schedule_name}' for chat_id {chat_id}")
+                    old_mongodb_id = str(existing_message['_id']) # Renamed to avoid confusion with telegram message id
+                    sent_telegram_message_ids = existing_message.get('sent_message_ids')
+
+                    if sent_telegram_message_ids:
+                        logger.info(f"Deleting {len(sent_telegram_message_ids)} previously sent messages for overwritten schedule {old_mongodb_id} in chat {chat_id}")
+                        for telegram_msg_id in sent_telegram_message_ids:
+                            try:
+                                await self.client.delete_messages(chat_id, message_ids=[telegram_msg_id])
+                                logger.debug(f"Successfully deleted message ID {telegram_msg_id} from chat {chat_id} for schedule {old_mongodb_id}")
+                            except MessageDeleteForbiddenError:
+                                logger.warning(f"Could not delete message ID {telegram_msg_id} from chat {chat_id} for schedule {old_mongodb_id}: Bot does not have permission.")
+                            except MessageIdInvalidError:
+                                logger.warning(f"Could not delete message ID {telegram_msg_id} from chat {chat_id} for schedule {old_mongodb_id}: Message ID invalid or already deleted.")
+                            except Exception as e:
+                                logger.error(f"Unexpected error deleting message ID {telegram_msg_id} from chat {chat_id} for schedule {old_mongodb_id}: {e}")
+
+                    sent_status = existing_message.get('sent', False) # For one-time messages
+                    self.collection.delete_one({"_id": ObjectId(old_mongodb_id)})
+                    if not sent_status: # If it's a repeating schedule or a one-time that hasn't fired
+                        schedule.clear(f"message_{old_mongodb_id}")
+                    logger.info(f"Auto-deleted existing schedule {old_mongodb_id} (one-time sent status: {sent_status}) with schedule_name '{schedule_name}' for chat_id {chat_id}")
 
                 state_data['data']['schedule_name'] = schedule_name
                 state_data['state'] = 'MESSAGE_TEXT'
@@ -462,8 +480,9 @@ class MessageSchedulerBot:
                                 file_reference=b''
                             )
                         )
+                    sent_telegram_message = None
                     if media:
-                        await self.client.send_message(
+                        sent_telegram_message = await self.client.send_message(
                             chat_id,
                             message["message_text"],
                             file=media,
@@ -474,12 +493,18 @@ class MessageSchedulerBot:
                         logger.error(f"Invalid media type for message {message_id}")
                         return
                 else:
-                    await self.client.send_message(
+                    sent_telegram_message = await self.client.send_message(
                         chat_id,
                         message["message_text"],
                         buttons=keyboard
                     )
                     logger.info(f"Sent text message {message_id}")
+
+                if sent_telegram_message:
+                    self.collection.update_one(
+                        {"_id": ObjectId(message_id)},
+                        {"$push": {"sent_message_ids": sent_telegram_message.id}}
+                    )
 
                 if not message.get("interval_seconds"):
                     self.collection.update_one({"_id": ObjectId(message_id)}, {"$set": {"sent": True}})
