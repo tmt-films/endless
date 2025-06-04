@@ -27,8 +27,9 @@ This is a Python-based Telegram bot designed for group administrators to schedul
 1.  **Clone the repository (if applicable) or ensure `bot.py` is present.**
 
 2.  **Install Dependencies:**
+    Make sure you have `pip` (Python package installer) available. Install the required Python packages using the `requirements.txt` file:
     ```bash
-    pip install telethon==1.36.0 schedule==1.2.2 pymongo==4.10.1 python-dotenv==1.0.1
+    pip install -r requirements.txt
     ```
 
 3.  **Set up MongoDB:**
